@@ -262,18 +262,21 @@ class SynthesisBlockNoUp(torch.nn.Module):
 # for 512x512 generation
 @persistence.persistent_class
 class SuperresolutionHybrid8XDC(torch.nn.Module):
-    def __init__(self, channels, img_resolution, sr_num_fp16_res, sr_antialias,
-                num_fp16_res=4, conv_clamp=None, channel_base=None, channel_max=None,# IGNORE
-                **block_kwargs):
+    def __init__(
+            self, channels, img_resolution, sr_num_fp16_res, sr_antialias,
+            channels_hidden=256,
+            num_fp16_res=4, conv_clamp=None, channel_base=None, channel_max=None,# IGNORE
+            **block_kwargs,
+        ):
         super().__init__()
         assert img_resolution == 512
 
         use_fp16 = sr_num_fp16_res > 0
         self.input_resolution = 128
         self.sr_antialias = sr_antialias
-        self.block0 = SynthesisBlock(channels, 256, w_dim=512, resolution=256,
+        self.block0 = SynthesisBlock(channels, channels_hidden, w_dim=512, resolution=256,
                 img_channels=3, is_last=False, use_fp16=use_fp16, conv_clamp=(256 if use_fp16 else None), **block_kwargs)
-        self.block1 = SynthesisBlock(256, 128, w_dim=512, resolution=512,
+        self.block1 = SynthesisBlock(channels_hidden, channels_hidden//2, w_dim=512, resolution=512,
                 img_channels=3, is_last=True, use_fp16=use_fp16, conv_clamp=(256 if use_fp16 else None), **block_kwargs)
 
     def forward(self, rgb, x, ws, **block_kwargs):
@@ -290,3 +293,10 @@ class SuperresolutionHybrid8XDC(torch.nn.Module):
         return rgb
 
 #----------------------------------------------------------------------------
+
+
+
+
+
+
+

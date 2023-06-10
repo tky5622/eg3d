@@ -20,21 +20,34 @@ import torch.nn as nn
 from training.volumetric_rendering.ray_marcher import MipRayMarcher2
 from training.volumetric_rendering import math_utils
 
-def generate_planes():
+import _util.util_v1 as uutil
+
+
+def generate_planes(use_triplane=False):
     """
     Defines planes by the three vectors that form the "axes" of the
     plane. Should work with arbitrary number of planes and planes of
     arbitrary orientation.
     """
-    return torch.tensor([[[1, 0, 0],
-                            [0, 1, 0],
-                            [0, 0, 1]],
-                            [[1, 0, 0],
-                            [0, 0, 1],
-                            [0, 1, 0]],
-                            [[0, 0, 1],
-                            [1, 0, 0],
-                            [0, 1, 0]]], dtype=torch.float32)
+    return torch.tensor([
+        [
+            [1, 0, 0],
+            [0, 1, 0],
+            [0, 0, 1],
+        ],[
+            [1, 0, 0],
+            [0, 0, 1],
+            [0, 1, 0],
+        ],[
+            [0, 0, 1],
+            [1, 0, 0],
+            [0, 1, 0],
+        ] if not use_triplane else [
+            [0, 1, 0],
+            [0, 0, 1],
+            [1, 0, 0],
+        ],
+    ], dtype=torch.float32)
 
 def project_onto_planes(planes, coordinates):
     """
@@ -50,19 +63,62 @@ def project_onto_planes(planes, coordinates):
     coordinates = coordinates.unsqueeze(1).expand(-1, n_planes, -1, -1).reshape(N*n_planes, M, 3)
     inv_planes = torch.linalg.inv(planes).unsqueeze(0).expand(N, -1, -1, -1).reshape(N*n_planes, 3, 3)
     projections = torch.bmm(coordinates, inv_planes)
-    return projections[..., :2]
+    return projections #[..., :2]  # yichuns multiplane
 
-def sample_from_planes(plane_axes, plane_features, coordinates, mode='bilinear', padding_mode='zeros', box_warp=None):
-    assert padding_mode == 'zeros'
-    N, n_planes, C, H, W = plane_features.shape
-    _, M, _ = coordinates.shape
-    plane_features = plane_features.view(N*n_planes, C, H, W)
+def sample_from_planes(plane_axes, plane_features, coordinates, mode='bilinear', padding_mode='zeros', box_warp=None, triplane_depth=1):
+    # for q in ['plane_axes', 'plane_features', 'coordinates', 'mode', 'padding_mode', 'box_warp', 'triplane_depth']:
+    #     uutil.pdump(eval(q), uutil.mkfile(f'/dev/shm/sample_from_planes/{q}.pkl'))
+    if triplane_depth==1:  # normal eg3d
+        assert padding_mode == 'zeros'
+        N, n_planes, C, H, W = plane_features.shape
+        _, M, _ = coordinates.shape
+        plane_features = plane_features.view(N*n_planes, C, H, W)
 
-    coordinates = (2/box_warp) * coordinates # TODO: add specific box bounds
+        coordinates = (2/box_warp) * coordinates # TODO: add specific box bounds
 
-    projected_coordinates = project_onto_planes(plane_axes, coordinates).unsqueeze(1)
-    output_features = torch.nn.functional.grid_sample(plane_features, projected_coordinates.float(), mode=mode, padding_mode=padding_mode, align_corners=False).permute(0, 3, 2, 1).reshape(N, n_planes, M, C)
-    return output_features
+        projected_coordinates = project_onto_planes(plane_axes, coordinates)[..., :2].unsqueeze(1)
+        output_features = torch.nn.functional.grid_sample(plane_features, projected_coordinates.float(), mode=mode, padding_mode=padding_mode, align_corners=False).permute(0, 3, 2, 1).reshape(N, n_planes, M, C)
+        return output_features
+    else:  # yichuns multiplane
+        assert padding_mode == 'zeros'
+        N, n_planes, CD, H, W = plane_features.shape
+        _, M, _ = coordinates.shape
+        C, D = CD // triplane_depth, triplane_depth
+        plane_features = plane_features.view(N*n_planes, C, D, H, W)
+
+        coordinates = (2/box_warp) * coordinates # TODO: add specific box bounds
+
+        projected_coordinates = project_onto_planes(plane_axes, coordinates).unsqueeze(1).unsqueeze(2) # (N x n_planes) x 1 x 1 x M x 3
+        output_features = torch.nn.functional.grid_sample(plane_features, projected_coordinates.float(), mode=mode, padding_mode=padding_mode, align_corners=False).permute(0, 4, 3, 2, 1).reshape(N, n_planes, M, C)
+        return output_features
+
+# def project_onto_planes(planes, coordinates):
+#     """
+#     Does a projection of a 3D point onto a batch of 2D planes,
+#     returning 2D plane coordinates.
+
+#     Takes plane axes of shape n_planes, 3, 3
+#     # Takes coordinates of shape N, M, 3
+#     # returns projections of shape N*n_planes, M, 2
+#     """
+#     N, M, C = coordinates.shape
+#     n_planes, _, _ = planes.shape
+#     coordinates = coordinates.unsqueeze(1).expand(-1, n_planes, -1, -1).reshape(N*n_planes, M, 3)
+#     inv_planes = torch.linalg.inv(planes).unsqueeze(0).expand(N, -1, -1, -1).reshape(N*n_planes, 3, 3)
+#     projections = torch.bmm(coordinates, inv_planes)
+#     return projections
+
+# def sample_from_planes(plane_axes, plane_features, coordinates, mode='bilinear', padding_mode='zeros', box_warp=None):
+#     assert padding_mode == 'zeros'
+#     N, n_planes, C, H, W = plane_features.shape
+#     _, M, _ = coordinates.shape
+#     plane_features = plane_features.view(N*n_planes, C, H, W)
+
+#     coordinates = (2/box_warp) * coordinates # TODO: add specific box bounds
+
+#     projected_coordinates = project_onto_planes(plane_axes, coordinates).unsqueeze(1)
+#     output_features = torch.nn.functional.grid_sample(plane_features, projected_coordinates.float(), mode=mode, padding_mode=padding_mode, align_corners=False).permute(0, 3, 2, 1).reshape(N, n_planes, M, C)
+#     return output_features
 
 def sample_from_3dgrid(grid, coordinates):
     """
@@ -79,13 +135,31 @@ def sample_from_3dgrid(grid, coordinates):
     sampled_features = sampled_features.permute(0, 4, 3, 2, 1).reshape(N, H*W*D, C)
     return sampled_features
 
+def triplane_crop_mask(xyz_unformatted, thresh, boxwarp, allow_bottom=True):
+    bw,tc = boxwarp, thresh
+    device = xyz_unformatted.device
+    # xyz = 0.5 * (xyz_unformatted+1) * torch.tensor([-1,1,-1]).to(device)[None,None,:]
+    xyz = (xyz_unformatted) * torch.tensor([-1,1,-1]).to(device)[None,None,:]
+    ans = (xyz[:,:,[0,2]].abs() <= (bw/2-tc)).all(dim=-1,keepdim=True)
+    if allow_bottom:
+        ans = ans | (
+            (xyz[:,:,1:2] <= -(bw/2-tc)) &
+            (xyz[:,:,[0,2]].abs() <= (bw/2-tc)).all(dim=-1,keepdim=True)
+        )
+    return ~ans
+def cull_clouds_mask(denities, thresh):
+    denities = torch.nn.functional.softplus(denities - 1) # activation bias of -1 makes things initialize better
+    alpha = 1 - torch.exp(-denities)
+    return alpha < thresh
+
+
 class ImportanceRenderer(torch.nn.Module):
-    def __init__(self):
+    def __init__(self, use_triplane=False):
         super().__init__()
         self.ray_marcher = MipRayMarcher2()
-        self.plane_axes = generate_planes()
+        self.plane_axes = generate_planes(use_triplane=use_triplane)
 
-    def forward(self, planes, decoder, ray_origins, ray_directions, rendering_options):
+    def forward(self, planes, decoder, ray_origins, ray_directions, rendering_options, triplane_crop=None, cull_clouds=None, binarize_clouds=None):
         self.plane_axes = self.plane_axes.to(ray_origins.device)
 
         if rendering_options['ray_start'] == rendering_options['ray_end'] == 'auto':
@@ -109,7 +183,26 @@ class ImportanceRenderer(torch.nn.Module):
         out = self.run_model(planes, decoder, sample_coordinates, sample_directions, rendering_options)
         colors_coarse = out['rgb']
         densities_coarse = out['sigma']
+        xyz_coarse = out['xyz']
+        if triplane_crop:
+            # print(xyz_fine.amin(dim=(0,1)))
+            # print(xyz_fine.amax(dim=(0,1)))
+            cropmask = triplane_crop_mask(xyz_coarse, triplane_crop, rendering_options['box_warp'])
+            densities_coarse[cropmask] = -1e3
+        if binarize_clouds:
+            ccmask = cull_clouds_mask(densities_coarse, binarize_clouds)
+            densities_coarse[ccmask] = -1e3
+            densities_coarse[~ccmask] = 1e3
+        elif cull_clouds:
+            ccmask = cull_clouds_mask(densities_coarse, cull_clouds)
+            densities_coarse[ccmask] = -1e3
+        # if triplane_crop:
+        #     cropmask = triplane_crop_mask(xyz_coarse, triplane_crop, rendering_options['box_warp'])
+        #     densities_coarse[cropmask] = -1e3
+        # print(out['rgb'].shape)
+        # print(out['sigma'].shape)
         colors_coarse = colors_coarse.reshape(batch_size, num_rays, samples_per_ray, colors_coarse.shape[-1])
+        xyz_coarse = xyz_coarse.reshape(batch_size, num_rays, samples_per_ray, xyz_coarse.shape[-1])
         densities_coarse = densities_coarse.reshape(batch_size, num_rays, samples_per_ray, 1)
 
         # Fine Pass
@@ -119,32 +212,71 @@ class ImportanceRenderer(torch.nn.Module):
 
             depths_fine = self.sample_importance(depths_coarse, weights, N_importance)
 
-            sample_directions = ray_directions.unsqueeze(-2).expand(-1, -1, N_importance, -1).reshape(batch_size, -1, 3)
             sample_coordinates = (ray_origins.unsqueeze(-2) + depths_fine * ray_directions.unsqueeze(-2)).reshape(batch_size, -1, 3)
+            
+            # shu added: have all directions point to center (for ambient-lit)
+            if rendering_options.get('directionless', False):
+                sample_directions = -sample_coordinates/sample_coordinates.norm(dim=-1, keepdim=True).clip(0.01)
+            else:
+                sample_directions = ray_directions.unsqueeze(-2).expand(-1, -1, N_importance, -1).reshape(batch_size, -1, 3)
 
             out = self.run_model(planes, decoder, sample_coordinates, sample_directions, rendering_options)
             colors_fine = out['rgb']
             densities_fine = out['sigma']
+            xyz_fine = out['xyz']
+            if triplane_crop:
+                # print(xyz_fine.amin(dim=(0,1)))
+                # print(xyz_fine.amax(dim=(0,1)))
+                cropmask = triplane_crop_mask(xyz_fine, triplane_crop, rendering_options['box_warp'])
+                densities_fine[cropmask] = -1e3
+            if binarize_clouds:
+                ccmask = cull_clouds_mask(densities_fine, binarize_clouds)
+                densities_fine[ccmask] = -1e3
+                densities_fine[~ccmask] = 1e3
+            elif cull_clouds:
+                ccmask = cull_clouds_mask(densities_fine, cull_clouds)
+                densities_fine[ccmask] = -1e3
             colors_fine = colors_fine.reshape(batch_size, num_rays, N_importance, colors_fine.shape[-1])
             densities_fine = densities_fine.reshape(batch_size, num_rays, N_importance, 1)
+            xyz_fine = xyz_fine.reshape(batch_size, num_rays, N_importance, xyz_fine.shape[-1])
 
-            all_depths, all_colors, all_densities = self.unify_samples(depths_coarse, colors_coarse, densities_coarse,
-                                                                  depths_fine, colors_fine, densities_fine)
+            all_depths, all_colors, all_densities, all_xyz = self.unify_samples(
+                depths_coarse, colors_coarse, densities_coarse, xyz_coarse,
+                depths_fine, colors_fine, densities_fine, xyz_fine,
+            )
 
             # Aggregate
-            rgb_final, depth_final, weights = self.ray_marcher(all_colors, all_densities, all_depths, rendering_options)
+            # rgb_final, depth_final, weights = self.ray_marcher(all_colors, all_densities, all_depths, rendering_options)
+            all_colors_ = torch.cat([all_colors, all_xyz], dim=-1)
+            rgb_final_, depth_final, weights = self.ray_marcher(all_colors_, all_densities, all_depths, rendering_options)
+            rgb_final = rgb_final_[...,:-3]
+            xyz_final = rgb_final_[...,-3:]
         else:
-            rgb_final, depth_final, weights = self.ray_marcher(colors_coarse, densities_coarse, depths_coarse, rendering_options)
+            # rgb_final, depth_final, weights = self.ray_marcher(colors_coarse, densities_coarse, depths_coarse, rendering_options)
+            colors_coarse_ = torch.cat([colors_coarse, xyz_coarse], dim=-1)
+            rgb_final_, depth_final, weights = self.ray_marcher(colors_coarse_, densities_coarse, depths_coarse, rendering_options)
+            rgb_final = rgb_final_[...,:-3]
+            xyz_final = rgb_final_[...,-3:]
 
-
-        return rgb_final, depth_final, weights.sum(2)
+        # print(rgb_final.shape)
+        # print(depth_final.shape)
+        # print(weights.shape)
+        return rgb_final, depth_final, weights.sum(2), xyz_final
 
     def run_model(self, planes, decoder, sample_coordinates, sample_directions, options):
-        sampled_features = sample_from_planes(self.plane_axes, planes, sample_coordinates, padding_mode='zeros', box_warp=options['box_warp'])
+        sampled_features = sample_from_planes(
+            self.plane_axes, planes, sample_coordinates,
+            padding_mode='zeros', box_warp=options['box_warp'],
+            triplane_depth=1 if 'triplane_depth' not in options else options['triplane_depth'],
+        )
+        # print(sample_coordinates.shape)
+        # print(sampled_features.shape)
 
         out = decoder(sampled_features, sample_directions)
         if options.get('density_noise', 0) > 0:
             out['sigma'] += torch.randn_like(out['sigma']) * options['density_noise']
+        # print(out['rgb'].shape)
+        out['xyz'] = sample_coordinates#.permute(0,2,1)[...,None]
         return out
 
     def sort_samples(self, all_depths, all_colors, all_densities):
@@ -154,17 +286,19 @@ class ImportanceRenderer(torch.nn.Module):
         all_densities = torch.gather(all_densities, -2, indices.expand(-1, -1, -1, 1))
         return all_depths, all_colors, all_densities
 
-    def unify_samples(self, depths1, colors1, densities1, depths2, colors2, densities2):
+    def unify_samples(self, depths1, colors1, densities1, xyz1, depths2, colors2, densities2, xyz2):
         all_depths = torch.cat([depths1, depths2], dim = -2)
         all_colors = torch.cat([colors1, colors2], dim = -2)
+        all_xyz = torch.cat([xyz1, xyz2], dim = -2)
         all_densities = torch.cat([densities1, densities2], dim = -2)
 
         _, indices = torch.sort(all_depths, dim=-2)
         all_depths = torch.gather(all_depths, -2, indices)
         all_colors = torch.gather(all_colors, -2, indices.expand(-1, -1, -1, all_colors.shape[-1]))
+        all_xyz = torch.gather(all_xyz, -2, indices.expand(-1, -1, -1, all_xyz.shape[-1]))
         all_densities = torch.gather(all_densities, -2, indices.expand(-1, -1, -1, 1))
 
-        return all_depths, all_colors, all_densities
+        return all_depths, all_colors, all_densities, all_xyz
 
     def sample_stratified(self, ray_origins, ray_start, ray_end, depth_resolution, disparity_space_sampling=False):
         """

@@ -20,6 +20,9 @@ import numpy as np
 import torch
 import dnnlib
 
+import _util.pytorch_v1 as utorch
+
+
 #----------------------------------------------------------------------------
 
 class MetricOptions:
@@ -57,16 +60,25 @@ def get_feature_detector(url, device=torch.device('cpu'), num_gpus=1, rank=0, ve
 #----------------------------------------------------------------------------
 
 def iterate_random_labels(opts, batch_size):
-    if opts.G.c_dim == 0:
-        c = torch.zeros([batch_size, opts.G.c_dim], device=opts.device)
-        while True:
-            yield c
-    else:
-        dataset = dnnlib.util.construct_class_by_name(**opts.dataset_kwargs)
-        while True:
-            c = [dataset.get_label(np.random.randint(len(dataset))) for _i in range(batch_size)]
-            c = torch.from_numpy(np.stack(c)).pin_memory().to(opts.device)
-            yield c
+    # if opts.G.c_dim == 0:
+    #     c = torch.zeros([batch_size, opts.G.c_dim], device=opts.device)
+    #     while True:
+    #         yield c
+    # else:
+    #     dataset = dnnlib.util.construct_class_by_name(**opts.dataset_kwargs)
+    #     while True:
+    #         c = [dataset.get_label(np.random.randint(len(dataset))) for _i in range(batch_size)]
+    #         c = torch.from_numpy(np.stack(c)).pin_memory().to(opts.device)
+    #         yield c
+    dataset = dnnlib.util.construct_class_by_name(**opts.dataset_kwargs)
+    while True:
+        c = [dataset.get_label(np.random.randint(len(dataset))) for _i in range(batch_size)]
+        c = torch.from_numpy(np.stack(c)).pin_memory().to(opts.device)
+        cond = utorch.default_collate([
+            dataset[np.random.randint(len(dataset))]['condition']
+            for _i in range(batch_size)
+        ], device=opts.device)
+        yield c, cond
 
 #----------------------------------------------------------------------------
 
@@ -206,7 +218,8 @@ def compute_feature_stats_for_dataset(opts, detector_url, detector_kwargs, rel_l
         # Choose cache file name.
         args = dict(dataset_kwargs=opts.dataset_kwargs, detector_url=detector_url, detector_kwargs=detector_kwargs, stats_kwargs=stats_kwargs)
         md5 = hashlib.md5(repr(sorted(args.items())).encode('utf-8'))
-        cache_tag = f'{dataset.name}-{get_feature_detector_name(detector_url)}-{md5.hexdigest()}'
+        # cache_tag = f'{dataset.name}-{get_feature_detector_name(detector_url)}-{md5.hexdigest()}'
+        cache_tag = f'{dataset.name}-{get_feature_detector_name(detector_url)}'
         cache_file = dnnlib.make_cache_dir_path('gan-metrics', cache_tag + '.pkl')
 
         # Check if the file exists (all processes must agree).
@@ -230,7 +243,9 @@ def compute_feature_stats_for_dataset(opts, detector_url, detector_kwargs, rel_l
 
     # Main loop.
     item_subset = [(i * opts.num_gpus + opts.rank) % num_items for i in range((num_items - 1) // opts.num_gpus + 1)]
-    for images, _labels in torch.utils.data.DataLoader(dataset=dataset, sampler=item_subset, batch_size=batch_size, **data_loader_kwargs):
+    # for images, _labels in torch.utils.data.DataLoader(dataset=dataset, sampler=item_subset, batch_size=batch_size, **data_loader_kwargs):
+    for sample in torch.utils.data.DataLoader(dataset=dataset, sampler=item_subset, batch_size=batch_size, **data_loader_kwargs):
+        images = sample['image']
         if images.shape[1] == 1:
             images = images.repeat([1, 3, 1, 1])
         features = detector(images.to(opts.device), **detector_kwargs)
@@ -267,7 +282,8 @@ def compute_feature_stats_for_generator(opts, detector_url, detector_kwargs, rel
         images = []
         for _i in range(batch_size // batch_gen):
             z = torch.randn([batch_gen, G.z_dim], device=opts.device)
-            img = G(z=z, c=next(c_iter), **opts.G_kwargs)['image']
+            c, cond = next(c_iter)
+            img = G(z=z, c=c, cond=cond, **opts.G_kwargs)['image']
             img = (img * 127.5 + 128).clamp(0, 255).to(torch.uint8)
             images.append(img)
         images = torch.cat(images)
